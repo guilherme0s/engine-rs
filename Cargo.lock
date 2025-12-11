@@ -28,6 +28,9 @@ dependencies = [
 [[package]]
 name = "launcher"
 version = "0.1.0"
+dependencies = [
+ "graphics",
+]
 
 [[package]]
 name = "libloading"
