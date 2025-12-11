@@ -7,10 +7,11 @@ use crate::error::GraphicsError;
 pub struct VulkanGraphicsDevice {
     _entry: ash::Entry,
     instance: ash::Instance,
-    #[cfg(debug_assertions)]
     debug_utils: Option<ash::ext::debug_utils::Instance>,
-    #[cfg(debug_assertions)]
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    _physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    _graphics_queue: vk::Queue,
 }
 
 impl VulkanGraphicsDevice {
@@ -20,13 +21,20 @@ impl VulkanGraphicsDevice {
                 GraphicsError::DeviceInitializationFailed(format!("Failed to load Vulkan: {:?}", e))
             })?
         };
+
         let (instance, debug_utils, debug_messenger) = Self::create_instance(&entry)?;
+
+        let physical_device = Self::select_physical_device(&instance)?;
+        let (device, graphics_queue) = Self::create_logical_device(&instance, physical_device)?;
 
         Ok(Self {
             _entry: entry,
             instance,
-            debug_messenger,
             debug_utils,
+            debug_messenger,
+            _physical_device: physical_device,
+            device,
+            _graphics_queue: graphics_queue,
         })
     }
 
@@ -112,11 +120,81 @@ impl VulkanGraphicsDevice {
 
         Ok((instance, debug_utils, debug_messenger))
     }
+
+    fn select_physical_device(
+        instance: &ash::Instance,
+    ) -> Result<vk::PhysicalDevice, GraphicsError> {
+        let devices = unsafe {
+            instance.enumerate_physical_devices().map_err(|_| {
+                GraphicsError::DeviceInitializationFailed(
+                    "Failed to enumerate physical devices".into(),
+                )
+            })?
+        };
+
+        for &device in devices.iter() {
+            // TODO: For simplicity, pick the first one
+            return Ok(device);
+        }
+
+        Err(GraphicsError::DeviceInitializationFailed(
+            "No Vulkan-compatible GPU found".into(),
+        ))
+    }
+
+    fn create_logical_device(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<(ash::Device, vk::Queue), GraphicsError> {
+        let queue_family_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+        let mut graphics_family_index = None;
+
+        for (index, info) in queue_family_properties.iter().enumerate() {
+            if info.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                graphics_family_index = Some(index as u32);
+                break;
+            }
+        }
+
+        let graphics_family_index = graphics_family_index.ok_or(
+            GraphicsError::DeviceInitializationFailed("No graphics queue found".into()),
+        )?;
+
+        let queue_priority = [1.0_f32];
+        let queue_info = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(graphics_family_index)
+            .queue_priorities(&queue_priority)];
+
+        let device_features = vk::PhysicalDeviceFeatures::default();
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_info)
+            .enabled_features(&device_features);
+
+        let device = unsafe {
+            instance
+                .create_device(physical_device, &device_create_info, None)
+                .map_err(|e| {
+                    GraphicsError::DeviceInitializationFailed(format!(
+                        "Failed to create logical device: {:?}",
+                        e
+                    ))
+                })?
+        };
+
+        let graphics_queue = unsafe { device.get_device_queue(graphics_family_index, 0) };
+
+        Ok((device, graphics_queue))
+    }
 }
 
 impl Drop for VulkanGraphicsDevice {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_device(None);
+
             if let (Some(utils), Some(messenger)) =
                 (self.debug_utils.as_ref(), self.debug_messenger)
             {
