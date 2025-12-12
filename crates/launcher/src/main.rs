@@ -14,11 +14,17 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(Window::default_attributes())
-            .unwrap();
+        if self.window.is_some() {
+            return;
+        }
 
-        window.set_decorations(true);
+        let window_attributes = Window::default_attributes()
+            .with_title("Untitled")
+            .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
+
+        let window = event_loop
+            .create_window(window_attributes)
+            .expect("Failed to create window");
 
         self.vulkan_device = Some(
             VulkanGraphicsDevice::new(&window).expect("Failed to create VulkanGraphicsDevice"),
@@ -30,25 +36,44 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                println!("The close button was pressed; stopping");
+                if let Some(device) = &self.vulkan_device {
+                    let _ = device.wait_idle();
+                }
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                self.window.as_ref().unwrap().request_redraw();
+                // Draw frame
+                if let Some(device) = &mut self.vulkan_device {
+                    if let Err(e) = device.draw_frame() {
+                        eprintln!("Failed to draw frame: {}", e);
+                    }
+                }
+
+                // Request next redraw
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             _ => (),
+        }
+    }
+
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        // Request redraw on each event loop iteration
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new()?;
 
+    // Poll mode for continuous rendering
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::default();
-    let _ = event_loop.run_app(&mut app);
+    event_loop.run_app(&mut app)?;
 
     Ok(())
 }

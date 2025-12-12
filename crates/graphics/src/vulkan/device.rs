@@ -2,10 +2,13 @@ use ash::{
     khr,
     vk::{self},
 };
-use std::ffi::{CStr, CString, c_char};
+use std::{
+    ffi::{CStr, CString, c_char},
+    u64,
+};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-const MAX_FRAMES_IN_FLIGHT: u32 = 3;
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Debug, Copy)]
@@ -46,20 +49,22 @@ pub struct VulkanGraphicsDevice {
     surface: vk::SurfaceKHR,
     _physical_device: vk::PhysicalDevice,
     device: ash::Device,
-    _graphics_queue: vk::Queue,
+    graphics_queue: vk::Queue,
     _graphics_family_index: u32,
     swapchain_loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     swapchain_image_views: Vec<vk::ImageView>,
+    swapchain_extent: vk::Extent2D,
     image_available_semaphores: Vec<vk::Semaphore>,
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
-    _command_buffers: Vec<vk::CommandBuffer>,
+    command_buffers: Vec<vk::CommandBuffer>,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
+    current_frame: usize,
 }
 
 impl VulkanGraphicsDevice {
@@ -85,24 +90,29 @@ impl VulkanGraphicsDevice {
             Self::create_logical_device(&instance, physical_device)?;
 
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
-        let (swapchain, swapchain_images, swapchain_format, extent) = Self::create_swapchain(
-            physical_device,
-            &surface_loader,
-            &swapchain_loader,
-            surface,
-            window.inner_size().width,
-            window.inner_size().height,
-        )?;
+        let (swapchain, swapchain_images, swapchain_format, swapchain_extent) =
+            Self::create_swapchain(
+                physical_device,
+                &surface_loader,
+                &swapchain_loader,
+                surface,
+                window.inner_size().width,
+                window.inner_size().height,
+            )?;
         let swapchain_image_views =
             Self::create_image_views(&device, &swapchain_images, swapchain_format)?;
 
         let render_pass = Self::create_render_pass(&device, swapchain_format)?;
 
         let (pipeline_layout, graphics_pipeline) =
-            Self::create_graphics_pipeline(&device, render_pass, extent)?;
+            Self::create_graphics_pipeline(&device, render_pass, swapchain_extent)?;
 
-        let framebuffers =
-            Self::create_framebuffers(&device, &swapchain_image_views, render_pass, extent)?;
+        let framebuffers = Self::create_framebuffers(
+            &device,
+            &swapchain_image_views,
+            render_pass,
+            swapchain_extent,
+        )?;
 
         let command_pool = Self::create_command_pool(&device, graphics_queue_family_index)?;
         let command_buffers = Self::create_command_buffers(&device, command_pool)?;
@@ -117,21 +127,140 @@ impl VulkanGraphicsDevice {
             surface,
             _physical_device: physical_device,
             device,
-            _graphics_queue: graphics_queue,
+            graphics_queue,
             _graphics_family_index: graphics_queue_family_index,
             swapchain_loader,
             swapchain,
             swapchain_image_views,
+            swapchain_extent,
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
             render_pass,
             framebuffers,
             command_pool,
-            _command_buffers: command_buffers,
+            command_buffers,
             pipeline_layout,
             graphics_pipeline,
+            current_frame: 0,
         })
+    }
+
+    pub fn draw_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let fence = self.in_flight_fences[self.current_frame];
+
+        unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
+
+        let image_index = unsafe {
+            self.swapchain_loader
+                .acquire_next_image(
+                    self.swapchain,
+                    u64::MAX,
+                    self.image_available_semaphores[self.current_frame],
+                    vk::Fence::null(),
+                )?
+                .0
+        };
+
+        unsafe {
+            self.device.reset_fences(&[fence])?;
+        };
+
+        let command_buffer = self.command_buffers[self.current_frame];
+
+        unsafe {
+            self.device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())?
+        };
+
+        self.record_command_buffer(command_buffer, image_index as usize)?;
+
+        let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let signal_semaphores = [self.render_finished_semaphores[self.current_frame]];
+
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(std::slice::from_ref(&command_buffer))
+            .signal_semaphores(&signal_semaphores);
+
+        unsafe {
+            self.device
+                .queue_submit(self.graphics_queue, &[submit_info], fence)?;
+        }
+
+        let swapchains = [self.swapchain];
+        let image_indices = [image_index];
+
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&signal_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+
+        unsafe {
+            self.swapchain_loader
+                .queue_present(self.graphics_queue, &present_info)?;
+        }
+
+        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+        Ok(())
+    }
+
+    pub fn wait_idle(&self) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe { self.device.device_wait_idle()? };
+        Ok(())
+    }
+
+    fn record_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image_index: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let begin_info = vk::CommandBufferBeginInfo::default();
+
+        unsafe {
+            self.device
+                .begin_command_buffer(command_buffer, &begin_info)?;
+        }
+
+        let clear_color = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+
+        let render_pass_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(self.framebuffers[image_index])
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain_extent,
+            })
+            .clear_values(std::slice::from_ref(&clear_color));
+
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_info,
+                vk::SubpassContents::INLINE,
+            );
+
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline,
+            );
+
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+
+            self.device.cmd_end_render_pass(command_buffer);
+
+            self.device.end_command_buffer(command_buffer)?;
+        }
+
+        Ok(())
     }
 
     fn create_instance(entry: &ash::Entry) -> Result<ash::Instance, Box<dyn std::error::Error>> {
