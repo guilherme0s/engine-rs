@@ -4,9 +4,11 @@ use std::ffi::{CStr, CString, c_char};
 pub struct VulkanGraphicsDevice {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
-
     debug_messenger: vk::DebugUtilsMessengerEXT,
     _physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    _graphics_queue: vk::Queue,
+    _graphics_family_index: u32,
 }
 
 impl VulkanGraphicsDevice {
@@ -17,12 +19,17 @@ impl VulkanGraphicsDevice {
         let (debug_utils_loader, debug_messenger) = Self::setup_debug_messenger(&entry, &instance)?;
 
         let physical_device = Self::select_physical_device(&instance)?;
+        let (device, graphics_queue, graphics_family_index) =
+            Self::create_logical_device(&instance, physical_device)?;
 
         Ok(Self {
             instance,
             debug_utils_loader,
             debug_messenger,
             _physical_device: physical_device,
+            device,
+            _graphics_queue: graphics_queue,
+            _graphics_family_index: graphics_family_index,
         })
     }
 
@@ -91,6 +98,10 @@ impl VulkanGraphicsDevice {
     ) -> Result<vk::PhysicalDevice, Box<dyn std::error::Error>> {
         let devices = unsafe { instance.enumerate_physical_devices()? };
 
+        if devices.is_empty() {
+            return Err("No Vulkan-capable GPU found".into());
+        }
+
         struct DeviceInfo {
             index: usize,
             handle: vk::PhysicalDevice,
@@ -129,11 +140,54 @@ impl VulkanGraphicsDevice {
 
         Err("No suitable GPU found".into())
     }
+
+    fn create_logical_device(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<(ash::Device, vk::Queue, u32), Box<dyn std::error::Error>> {
+        let queue_family_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+        let mut graphics_family_index = None;
+        for (index, info) in queue_family_properties.iter().enumerate() {
+            if info.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                graphics_family_index = Some(index as u32);
+                break;
+            }
+        }
+
+        let graphics_family_index: u32 = graphics_family_index
+            .ok_or::<Box<dyn std::error::Error>>("No graphics queue family found".into())?;
+
+        let queue_priority = [1.0_f32];
+        let queue_info = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(graphics_family_index)
+            .queue_priorities(&queue_priority)];
+
+        let device_features = vk::PhysicalDeviceFeatures::default();
+        // TODO: Enable commonly used features for AAA rendering
+
+        let device_extensions = [khr::swapchain::NAME.as_ptr()];
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_info)
+            .enabled_features(&device_features)
+            .enabled_extension_names(&device_extensions);
+
+        let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
+        let graphics_queue = unsafe { device.get_device_queue(graphics_family_index, 0) };
+
+        Ok((device, graphics_queue, graphics_family_index))
+    }
 }
 
 impl Drop for VulkanGraphicsDevice {
     fn drop(&mut self) {
         unsafe {
+            // Wait for device to finish all operations before destroying
+            let _ = self.device.device_wait_idle();
+
+            self.device.destroy_device(None);
             self.debug_utils_loader
                 .destroy_debug_utils_messenger(self.debug_messenger, None);
             self.instance.destroy_instance(None);
