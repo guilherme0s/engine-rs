@@ -49,7 +49,10 @@ impl VulkanGraphicsDevice {
         extensions.push(ash::ext::debug_utils::NAME.as_ptr());
 
         #[cfg(target_os = "linux")]
-        extensions.push(khr::wayland_surface::NAME.as_ptr());
+        {
+            extensions.push(khr::wayland_surface::NAME.as_ptr());
+            extensions.push(khr::xlib_surface::NAME.as_ptr());
+        }
 
         let layer_names = [c"VK_LAYER_KHRONOS_validation"];
         let layers_names_raw: Vec<*const c_char> = layer_names
