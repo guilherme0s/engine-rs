@@ -1,13 +1,12 @@
 use ash::{khr, vk};
-use std::{
-    borrow::Cow,
-    ffi::{CStr, CString, c_char},
-};
+use std::ffi::{CStr, CString, c_char};
 
 pub struct VulkanGraphicsDevice {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
+
     debug_messenger: vk::DebugUtilsMessengerEXT,
+    _physical_device: vk::PhysicalDevice,
 }
 
 impl VulkanGraphicsDevice {
@@ -17,10 +16,13 @@ impl VulkanGraphicsDevice {
 
         let (debug_utils_loader, debug_messenger) = Self::setup_debug_messenger(&entry, &instance)?;
 
+        let physical_device = Self::select_physical_device(&instance)?;
+
         Ok(Self {
             instance,
             debug_utils_loader,
             debug_messenger,
+            _physical_device: physical_device,
         })
     }
 
@@ -79,13 +81,53 @@ impl VulkanGraphicsDevice {
             )
             .pfn_user_callback(Some(vulkan_debug_callback));
 
-        let messenger = unsafe {
-            loader
-                .create_debug_utils_messenger(&create_info, None)
-                .unwrap()
-        };
+        let messenger = unsafe { loader.create_debug_utils_messenger(&create_info, None)? };
 
         Ok((loader, messenger))
+    }
+
+    fn select_physical_device(
+        instance: &ash::Instance,
+    ) -> Result<vk::PhysicalDevice, Box<dyn std::error::Error>> {
+        let devices = unsafe { instance.enumerate_physical_devices()? };
+
+        struct DeviceInfo {
+            index: usize,
+            handle: vk::PhysicalDevice,
+            properties: vk::PhysicalDeviceProperties,
+        }
+
+        let mut device_infos = Vec::new();
+        for (i, &device) in devices.iter().enumerate() {
+            let properties = unsafe { instance.get_physical_device_properties(device) };
+            device_infos.push(DeviceInfo {
+                index: i,
+                handle: device,
+                properties,
+            });
+        }
+
+        // Priority: Discrete GPU > Integrated GPU > Virtual GPU > CPU > Other
+        device_infos.sort_by(|a, b| {
+            let a_type = a.properties.device_type;
+            let b_type = b.properties.device_type;
+
+            if a_type == b_type {
+                a.index.cmp(&b.index)
+            } else if a_type == vk::PhysicalDeviceType::DISCRETE_GPU {
+                std::cmp::Ordering::Less
+            } else if b_type == vk::PhysicalDeviceType::DISCRETE_GPU {
+                std::cmp::Ordering::Greater
+            } else {
+                a.index.cmp(&b.index)
+            }
+        });
+
+        for info in &device_infos {
+            return Ok(info.handle);
+        }
+
+        Err("No suitable GPU found".into())
     }
 }
 
@@ -105,24 +147,10 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user_data: *mut std::os::raw::c_void,
 ) -> vk::Bool32 {
-    let callback_data = unsafe { *p_callback_data };
-    let message_id_number = callback_data.message_id_number;
-
-    let message_id_name = if callback_data.p_message_id_name.is_null() {
-        Cow::from("")
-    } else {
-        unsafe { CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy() }
-    };
-
-    let message = if callback_data.p_message.is_null() {
-        Cow::from("")
-    } else {
-        unsafe { CStr::from_ptr(callback_data.p_message).to_string_lossy() }
-    };
-
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
     println!(
-        "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
+        "[{:?}] [{:?}] {:?}",
+        message_severity, message_type, message
     );
-
     vk::FALSE
 }
