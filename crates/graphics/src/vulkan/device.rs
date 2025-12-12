@@ -24,6 +24,7 @@ pub struct VulkanGraphicsDevice {
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
     render_pass: vk::RenderPass,
+    framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl VulkanGraphicsDevice {
@@ -49,7 +50,7 @@ impl VulkanGraphicsDevice {
             Self::create_logical_device(&instance, physical_device)?;
 
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
-        let (swapchain, swapchain_images, swapchain_format) = Self::create_swapchain(
+        let (swapchain, swapchain_images, swapchain_format, extent) = Self::create_swapchain(
             physical_device,
             &surface_loader,
             &swapchain_loader,
@@ -61,6 +62,8 @@ impl VulkanGraphicsDevice {
             Self::create_image_views(&device, &swapchain_images, swapchain_format)?;
 
         let render_pass = Self::create_render_pass(&device, swapchain_format)?;
+        let framebuffers =
+            Self::create_framebuffers(&device, &swapchain_image_views, render_pass, extent)?;
 
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
             Self::create_sync_objects(&device)?;
@@ -82,6 +85,7 @@ impl VulkanGraphicsDevice {
             render_finished_semaphores,
             in_flight_fences,
             render_pass,
+            framebuffers,
         })
     }
 
@@ -245,7 +249,10 @@ impl VulkanGraphicsDevice {
         surface: vk::SurfaceKHR,
         width: u32,
         height: u32,
-    ) -> Result<(vk::SwapchainKHR, Vec<vk::Image>, vk::Format), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (vk::SwapchainKHR, Vec<vk::Image>, vk::Format, vk::Extent2D),
+        Box<dyn std::error::Error>,
+    > {
         let surface_capabilities = unsafe {
             surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?
         };
@@ -302,7 +309,7 @@ impl VulkanGraphicsDevice {
         let swapchain = unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
-        Ok((swapchain, swapchain_images, surface_format.format))
+        Ok((swapchain, swapchain_images, surface_format.format, extent))
     }
 
     fn create_image_views(
@@ -378,6 +385,31 @@ impl VulkanGraphicsDevice {
         Ok(render_pass)
     }
 
+    fn create_framebuffers(
+        device: &ash::Device,
+        image_views: &[vk::ImageView],
+        render_pass: vk::RenderPass,
+        extent: vk::Extent2D,
+    ) -> Result<Vec<vk::Framebuffer>, Box<dyn std::error::Error>> {
+        let mut framebuffers = Vec::new();
+
+        for &image_view in image_views {
+            let attachments = [image_view];
+            let framebuffer_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+
+            let framebuffer = unsafe { device.create_framebuffer(&framebuffer_info, None)? };
+
+            framebuffers.push(framebuffer);
+        }
+
+        Ok(framebuffers)
+    }
+
     fn create_sync_objects(
         device: &ash::Device,
     ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>), Box<dyn std::error::Error>>
@@ -417,6 +449,10 @@ impl Drop for VulkanGraphicsDevice {
             }
             for &fence in &self.in_flight_fences {
                 self.device.destroy_fence(fence, None);
+            }
+
+            for &framebuffer in &self.framebuffers {
+                self.device.destroy_framebuffer(framebuffer, None);
             }
 
             self.device.destroy_render_pass(self.render_pass, None);
