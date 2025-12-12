@@ -5,6 +5,8 @@ use ash::{
 use std::ffi::{CStr, CString, c_char};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+const MAX_FRAMES_IN_FLIGHT: u32 = 3;
+
 pub struct VulkanGraphicsDevice {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
@@ -18,6 +20,9 @@ pub struct VulkanGraphicsDevice {
     swapchain_loader: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     swapchain_image_views: Vec<vk::ImageView>,
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
 }
 
 impl VulkanGraphicsDevice {
@@ -54,6 +59,9 @@ impl VulkanGraphicsDevice {
         let swapchain_image_views =
             Self::create_image_views(&device, &swapchain_images, swapchain_format)?;
 
+        let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
+            Self::create_sync_objects(&device)?;
+
         Ok(Self {
             instance,
             debug_utils_loader,
@@ -67,6 +75,9 @@ impl VulkanGraphicsDevice {
             swapchain_loader,
             swapchain,
             swapchain_image_views,
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
         })
     }
 
@@ -169,16 +180,19 @@ impl VulkanGraphicsDevice {
                 std::cmp::Ordering::Less
             } else if b_type == vk::PhysicalDeviceType::DISCRETE_GPU {
                 std::cmp::Ordering::Greater
+            } else if a_type == vk::PhysicalDeviceType::INTEGRATED_GPU {
+                std::cmp::Ordering::Less
+            } else if b_type == vk::PhysicalDeviceType::INTEGRATED_GPU {
+                std::cmp::Ordering::Greater
             } else {
                 a.index.cmp(&b.index)
             }
         });
 
-        for info in &device_infos {
-            return Ok(info.handle);
-        }
-
-        Err("No suitable GPU found".into())
+        device_infos
+            .first()
+            .map(|info| Ok(info.handle))
+            .unwrap_or(Err("No suitable GPU found".into()))
     }
 
     fn create_logical_device(
@@ -320,6 +334,30 @@ impl VulkanGraphicsDevice {
 
         Ok(image_views)
     }
+
+    fn create_sync_objects(
+        device: &ash::Device,
+    ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>), Box<dyn std::error::Error>>
+    {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+        let mut image_available = Vec::new();
+        let mut render_finished = Vec::new();
+        let mut in_flight = Vec::new();
+
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let image_sem = unsafe { device.create_semaphore(&semaphore_info, None)? };
+            let render_sem = unsafe { device.create_semaphore(&semaphore_info, None)? };
+            let fence = unsafe { device.create_fence(&fence_info, None)? };
+
+            image_available.push(image_sem);
+            render_finished.push(render_sem);
+            in_flight.push(fence);
+        }
+
+        Ok((image_available, render_finished, in_flight))
+    }
 }
 
 impl Drop for VulkanGraphicsDevice {
@@ -327,6 +365,16 @@ impl Drop for VulkanGraphicsDevice {
         unsafe {
             // Wait for device to finish all operations before destroying
             let _ = self.device.device_wait_idle();
+
+            for &semaphore in &self.image_available_semaphores {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for &semaphore in &self.render_finished_semaphores {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            for &fence in &self.in_flight_fences {
+                self.device.destroy_fence(fence, None);
+            }
 
             for &image_view in &self.swapchain_image_views {
                 self.device.destroy_image_view(image_view, None);
