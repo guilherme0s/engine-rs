@@ -5,4 +5,6 @@ edition = "2024"
 
 [dependencies]
 ash = "0.38.0"
+ash-window = "0.13.0"
 thiserror = "2.0.17"
+winit = "0.30.12"

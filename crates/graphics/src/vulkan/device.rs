@@ -1,35 +1,72 @@
-use ash::{khr, vk};
+use ash::{
+    khr,
+    vk::{self},
+};
 use std::ffi::{CStr, CString, c_char};
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub struct VulkanGraphicsDevice {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
     debug_messenger: vk::DebugUtilsMessengerEXT,
+    surface_loader: khr::surface::Instance,
+    surface: vk::SurfaceKHR,
     _physical_device: vk::PhysicalDevice,
     device: ash::Device,
     _graphics_queue: vk::Queue,
     _graphics_family_index: u32,
+    swapchain_loader: khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 impl VulkanGraphicsDevice {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(window: &winit::window::Window) -> Result<Self, Box<dyn std::error::Error>> {
         let entry = unsafe { ash::Entry::load()? };
         let instance = Self::create_instance(&entry)?;
 
         let (debug_utils_loader, debug_messenger) = Self::setup_debug_messenger(&entry, &instance)?;
 
+        let surface_loader = khr::surface::Instance::new(&entry, &instance);
+        let surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                window.display_handle().unwrap().as_raw(),
+                window.window_handle().unwrap().as_raw(),
+                None,
+            )?
+        };
+
         let physical_device = Self::select_physical_device(&instance)?;
         let (device, graphics_queue, graphics_family_index) =
             Self::create_logical_device(&instance, physical_device)?;
+
+        let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
+        let (swapchain, swapchain_images, swapchain_format) = Self::create_swapchain(
+            physical_device,
+            &surface_loader,
+            &swapchain_loader,
+            surface,
+            window.inner_size().width,
+            window.inner_size().height,
+        )?;
+        let swapchain_image_views =
+            Self::create_image_views(&device, &swapchain_images, swapchain_format)?;
 
         Ok(Self {
             instance,
             debug_utils_loader,
             debug_messenger,
+            surface_loader,
+            surface,
             _physical_device: physical_device,
             device,
             _graphics_queue: graphics_queue,
             _graphics_family_index: graphics_family_index,
+            swapchain_loader,
+            swapchain,
+            swapchain_image_views,
         })
     }
 
@@ -182,6 +219,107 @@ impl VulkanGraphicsDevice {
 
         Ok((device, graphics_queue, graphics_family_index))
     }
+
+    fn create_swapchain(
+        physical_device: vk::PhysicalDevice,
+        surface_loader: &khr::surface::Instance,
+        swapchain_loader: &khr::swapchain::Device,
+        surface: vk::SurfaceKHR,
+        width: u32,
+        height: u32,
+    ) -> Result<(vk::SwapchainKHR, Vec<vk::Image>, vk::Format), Box<dyn std::error::Error>> {
+        let surface_capabilities = unsafe {
+            surface_loader.get_physical_device_surface_capabilities(physical_device, surface)?
+        };
+
+        let surface_formats = unsafe {
+            surface_loader.get_physical_device_surface_formats(physical_device, surface)?
+        };
+
+        let surface_format = surface_formats
+            .iter()
+            .find(|f| {
+                f.format == vk::Format::B8G8R8A8_SRGB
+                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            })
+            .unwrap_or(&surface_formats[0]);
+
+        let extent = if surface_capabilities.current_extent.width != u32::MAX {
+            surface_capabilities.current_extent
+        } else {
+            vk::Extent2D {
+                width: width.clamp(
+                    surface_capabilities.min_image_extent.width,
+                    surface_capabilities.max_image_extent.width,
+                ),
+                height: height.clamp(
+                    surface_capabilities.min_image_extent.height,
+                    surface_capabilities.max_image_extent.height,
+                ),
+            }
+        };
+
+        let image_count = (surface_capabilities.min_image_count + 1).min(
+            if surface_capabilities.max_image_count > 0 {
+                surface_capabilities.max_image_count
+            } else {
+                u32::MAX
+            },
+        );
+
+        let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(surface_format.format)
+            .image_color_space(surface_format.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(surface_capabilities.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(true);
+
+        let swapchain = unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
+        let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+
+        Ok((swapchain, swapchain_images, surface_format.format))
+    }
+
+    fn create_image_views(
+        device: &ash::Device,
+        images: &[vk::Image],
+        format: vk::Format,
+    ) -> Result<Vec<vk::ImageView>, Box<dyn std::error::Error>> {
+        let mut image_views = Vec::new();
+
+        for &image in images {
+            let create_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .components(vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                })
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            let image_view = unsafe { device.create_image_view(&create_info, None)? };
+
+            image_views.push(image_view);
+        }
+
+        Ok(image_views)
+    }
 }
 
 impl Drop for VulkanGraphicsDevice {
@@ -190,9 +328,20 @@ impl Drop for VulkanGraphicsDevice {
             // Wait for device to finish all operations before destroying
             let _ = self.device.device_wait_idle();
 
+            for &image_view in &self.swapchain_image_views {
+                self.device.destroy_image_view(image_view, None);
+            }
+
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None);
+
             self.device.destroy_device(None);
+
+            self.surface_loader.destroy_surface(self.surface, None);
+
             self.debug_utils_loader
                 .destroy_debug_utils_messenger(self.debug_messenger, None);
+
             self.instance.destroy_instance(None);
         }
     }

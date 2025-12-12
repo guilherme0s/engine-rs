@@ -18,8 +18,11 @@ impl ApplicationHandler for App {
             .create_window(Window::default_attributes())
             .unwrap();
 
-        self.vulkan_device =
-            Some(VulkanGraphicsDevice::new().expect("Failed to create VulkanGraphicsDevice"));
+        window.set_decorations(true);
+
+        self.vulkan_device = Some(
+            VulkanGraphicsDevice::new(&window).expect("Failed to create VulkanGraphicsDevice"),
+        );
 
         self.window = Some(window);
     }
