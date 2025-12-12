@@ -1,3 +1,5 @@
+use graphics::vulkan::device::VulkanGraphicsDevice;
+
 fn main() {
-    println!("Hello, world!");
+    let _ = VulkanGraphicsDevice::new();
 }
