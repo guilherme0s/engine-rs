@@ -25,6 +25,8 @@ pub struct VulkanGraphicsDevice {
     in_flight_fences: Vec<vk::Fence>,
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
+    command_pool: vk::CommandPool,
+    _command_buffers: Vec<vk::CommandBuffer>,
 }
 
 impl VulkanGraphicsDevice {
@@ -46,7 +48,7 @@ impl VulkanGraphicsDevice {
         };
 
         let physical_device = Self::select_physical_device(&instance)?;
-        let (device, graphics_queue, graphics_family_index) =
+        let (device, graphics_queue, graphics_queue_family_index) =
             Self::create_logical_device(&instance, physical_device)?;
 
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
@@ -64,7 +66,8 @@ impl VulkanGraphicsDevice {
         let render_pass = Self::create_render_pass(&device, swapchain_format)?;
         let framebuffers =
             Self::create_framebuffers(&device, &swapchain_image_views, render_pass, extent)?;
-
+        let command_pool = Self::create_command_pool(&device, graphics_queue_family_index)?;
+        let command_buffers = Self::create_command_buffers(&device, command_pool)?;
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
             Self::create_sync_objects(&device)?;
 
@@ -77,7 +80,7 @@ impl VulkanGraphicsDevice {
             _physical_device: physical_device,
             device,
             _graphics_queue: graphics_queue,
-            _graphics_family_index: graphics_family_index,
+            _graphics_family_index: graphics_queue_family_index,
             swapchain_loader,
             swapchain,
             swapchain_image_views,
@@ -86,6 +89,8 @@ impl VulkanGraphicsDevice {
             in_flight_fences,
             render_pass,
             framebuffers,
+            command_pool,
+            _command_buffers: command_buffers,
         })
     }
 
@@ -410,6 +415,31 @@ impl VulkanGraphicsDevice {
         Ok(framebuffers)
     }
 
+    fn create_command_pool(
+        device: &ash::Device,
+        queue_family_index: u32,
+    ) -> Result<vk::CommandPool, Box<dyn std::error::Error>> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+        Ok(command_pool)
+    }
+
+    fn create_command_buffers(
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+    ) -> Result<Vec<vk::CommandBuffer>, Box<dyn std::error::Error>> {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32);
+
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info)? };
+        Ok(command_buffers)
+    }
+
     fn create_sync_objects(
         device: &ash::Device,
     ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>), Box<dyn std::error::Error>>
@@ -451,11 +481,14 @@ impl Drop for VulkanGraphicsDevice {
                 self.device.destroy_fence(fence, None);
             }
 
+            self.device.destroy_command_pool(self.command_pool, None);
+
             for &framebuffer in &self.framebuffers {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
 
             self.device.destroy_render_pass(self.render_pass, None);
+
             for &image_view in &self.swapchain_image_views {
                 self.device.destroy_image_view(image_view, None);
             }
