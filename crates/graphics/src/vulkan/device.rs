@@ -7,6 +7,37 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 const MAX_FRAMES_IN_FLIGHT: u32 = 3;
 
+#[repr(C)]
+#[derive(Clone, Debug, Copy)]
+pub struct Vertex {
+    pub pos: [f32; 2],
+    pub color: [f32; 3],
+}
+
+impl Vertex {
+    pub fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<Self>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+    }
+
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(memoffset::offset_of!(Self, pos) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(memoffset::offset_of!(Self, color) as u32),
+        ]
+    }
+}
+
 pub struct VulkanGraphicsDevice {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
@@ -27,6 +58,8 @@ pub struct VulkanGraphicsDevice {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     _command_buffers: Vec<vk::CommandBuffer>,
+    pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
 }
 
 impl VulkanGraphicsDevice {
@@ -64,8 +97,13 @@ impl VulkanGraphicsDevice {
             Self::create_image_views(&device, &swapchain_images, swapchain_format)?;
 
         let render_pass = Self::create_render_pass(&device, swapchain_format)?;
+
+        let (pipeline_layout, graphics_pipeline) =
+            Self::create_graphics_pipeline(&device, render_pass, extent)?;
+
         let framebuffers =
             Self::create_framebuffers(&device, &swapchain_image_views, render_pass, extent)?;
+
         let command_pool = Self::create_command_pool(&device, graphics_queue_family_index)?;
         let command_buffers = Self::create_command_buffers(&device, command_pool)?;
         let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
@@ -91,6 +129,8 @@ impl VulkanGraphicsDevice {
             framebuffers,
             command_pool,
             _command_buffers: command_buffers,
+            pipeline_layout,
+            graphics_pipeline,
         })
     }
 
@@ -463,6 +503,128 @@ impl VulkanGraphicsDevice {
 
         Ok((image_available, render_finished, in_flight))
     }
+
+    fn create_graphics_pipeline(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        extent: vk::Extent2D,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error>> {
+        let vert_shader_code = include_bytes!("./shader.vert.spv");
+        let frag_shader_code = include_bytes!("./shader.frag.spv");
+
+        let vert_shader_module = Self::create_shader_module(device, vert_shader_code)?;
+        let frag_shader_module = Self::create_shader_module(device, frag_shader_code)?;
+
+        let entry_point_name = CString::new("main")?;
+
+        let vert_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_shader_module)
+            .name(&entry_point_name);
+
+        let frag_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_shader_module)
+            .name(&entry_point_name);
+
+        let shader_stages = [vert_stage_info, frag_stage_info];
+
+        let binding_description = Vertex::get_binding_description();
+        let attribute_descriptions = Vertex::get_attribute_descriptions();
+
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding_description))
+            .vertex_attribute_descriptions(&attribute_descriptions);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(std::slice::from_ref(&viewport))
+            .scissors(std::slice::from_ref(&scissor));
+
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .depth_bias_enable(false);
+
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .sample_shading_enable(false)
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false);
+
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(std::slice::from_ref(&color_blend_attachment));
+
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout =
+            unsafe { device.create_pipeline_layout(&pipeline_layout_info, None)? };
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let graphics_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, e)| e)?[0]
+        };
+
+        unsafe {
+            device.destroy_shader_module(vert_shader_module, None);
+            device.destroy_shader_module(frag_shader_module, None);
+        }
+
+        Ok((pipeline_layout, graphics_pipeline))
+    }
+
+    fn create_shader_module(
+        device: &ash::Device,
+        code: &[u8],
+    ) -> Result<vk::ShaderModule, Box<dyn std::error::Error>> {
+        let code_aligned = ash::util::read_spv(&mut std::io::Cursor::new(code))?;
+
+        let create_info = vk::ShaderModuleCreateInfo::default().code(&code_aligned);
+
+        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
+        Ok(shader_module)
+    }
 }
 
 impl Drop for VulkanGraphicsDevice {
@@ -486,6 +648,10 @@ impl Drop for VulkanGraphicsDevice {
             for &framebuffer in &self.framebuffers {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
+
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
 
             self.device.destroy_render_pass(self.render_pass, None);
 
